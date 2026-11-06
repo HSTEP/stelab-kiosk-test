@@ -1,0 +1,108 @@
+name: Publish STELAB Kiosk to GHCR (manual)
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: 'Type PUBLISH to publish the version from VERSION'
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  publish:
+    if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && inputs.confirmation == 'PUBLISH'
+    runs-on: ubuntu-24.04-arm
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install gateway test dependency
+        run: python -m pip install aiohttp python-xlib
+      - name: Validate source and fullscreen behavior
+        run: |
+          python scripts/validate.py
+          python -m unittest discover -s tests -v
+      - name: Read release metadata
+        id: meta
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          version = Path('VERSION').read_text().strip()
+          base = json.loads(Path('stelab-kiosk/build.yaml').read_text())['build_from']['aarch64']
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f'version={version}\nbase={base}\n')
+          PY
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Refuse to overwrite an existing release tag
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          if docker buildx imagetools inspect "ghcr.io/hstep/stelab-kiosk-test-aarch64:${VERSION}" >/dev/null 2>&1; then
+            echo 'This tag already exists. Increase VERSION and config.yaml version.' >&2
+            exit 1
+          fi
+      - name: Build ARM64 candidate
+        uses: docker/build-push-action@v6
+        with:
+          context: ./stelab-kiosk
+          platforms: linux/arm64
+          pull: true
+          no-cache: true
+          push: false
+          load: true
+          provenance: false
+          tags: ghcr.io/hstep/stelab-kiosk-test-aarch64:${{ steps.meta.outputs.version }}
+          build-args: |
+            BUILD_FROM=${{ steps.meta.outputs.base }}
+            BUILD_VERSION=${{ steps.meta.outputs.version }}
+      - name: Verify real Chromium profile across restart
+        timeout-minutes: 5
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          docker run --rm --platform linux/arm64 --entrypoint python3 \
+            -v "${GITHUB_WORKSPACE}/tests:/tests:ro" \
+            "ghcr.io/hstep/stelab-kiosk-test-aarch64:${VERSION}" \
+            /tests/smoke_browser_profile.py
+      - name: Verify remote desktop and ChatGPT in disposable container
+        timeout-minutes: 5
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          docker run --rm --platform linux/arm64 --cap-add SYS_ADMIN --entrypoint /bin/bash \
+            -v "${GITHUB_WORKSPACE}/tests:/tests:ro" \
+            "ghcr.io/hstep/stelab-kiosk-test-aarch64:${VERSION}" -ec '
+              apt-get update -qq
+              apt-get install -y --no-install-recommends xvfb
+              python3 /tests/smoke_remote_access.py
+              python3 /chatgpt_install.py
+              python3 /tests/smoke_chatgpt.py
+              python3 /tests/smoke_kiosk_sandbox.py
+              python3 /tests/smoke_desktop.py
+              python3 /tests/smoke_taskbar.py
+              python3 /tests/smoke_browser_visibility.py
+            '
+      - name: Publish the tested image
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: docker push "ghcr.io/hstep/stelab-kiosk-test-aarch64:${VERSION}"
+      - name: Verify anonymous ARM64 pull
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          anonymous_config=$(mktemp -d)
+          trap 'rm -rf "$anonymous_config"' EXIT
+          docker image rm "ghcr.io/hstep/stelab-kiosk-test-aarch64:${VERSION}"
+          docker --config "$anonymous_config" pull --platform linux/arm64 "ghcr.io/hstep/stelab-kiosk-test-aarch64:${VERSION}"
+          test "$(docker image inspect --format '{{.Architecture}}' "ghcr.io/hstep/stelab-kiosk-test-aarch64:${VERSION}")" = arm64
